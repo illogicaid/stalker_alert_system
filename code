@@ -68,6 +68,245 @@ void sendAlert(String mac, int rssi) {
 
   if (WiFi.status() != WL_CONNECTED) return;
 
+  WiFiClient client;
+  HTTPClient http;
+
+  http.begin(client, serverUrl);
+  http.addHeader("Content-Type", "application/json");
+
+  String json = "{";
+  json += "\"mac\":\"" + mac + "\",";
+  json += "\"rssi\":" + String(rssi);
+  json += "}";
+
+  int code = http.POST(json);
+
+  Serial.print("API Sent, code: ");
+  Serial.println(code);
+
+  http.end();
+}
+
+// ================= BLE CALLBACK =================
+
+class MyDiscoveryEvents : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice foundDevice) {   
+
+    String macAddr = foundDevice.getAddress().toString().c_str();
+    int rssi = foundDevice.getRSSI();
+
+    if (calibrationMode) {
+      if (!isTrusted(macAddr) && trustedCount < 15) {
+        trustedDevices[trustedCount++] = macAddr;
+        Serial.println("Trusted added: " + macAddr);
+      }
+      return;
+    }
+
+    if (isTrusted(macAddr)) return;
+
+    int foundIndex = checktheExisting(macAddr);
+
+    if (foundIndex == -1) {
+      if (total_detecteddevices < 15) {
+        No_of_devices[total_detecteddevices] = macAddr;
+        first_detected_at[total_detecteddevices] = millis();
+        Latest_signal_strength[total_detecteddevices] = rssi;
+        total_detecteddevices++;
+      }
+    } else {
+      Latest_signal_strength[foundIndex] = rssi;
+    }
+  }
+};
+
+static MyDiscoveryEvents myCallbacks;
+
+// ================= SETUP =================
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Guardian Booting up...");
+
+  pinMode(Yellow, OUTPUT);
+  pinMode(red, OUTPUT);
+  pinMode(beepsound, OUTPUT);
+  pinMode(SosPin, INPUT_PULLUP);
+
+  // WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi Connected");
+
+  BLEDevice::init("MyGuardianDevice");
+  scanner = BLEDevice::getScan();
+  scanner->setAdvertisedDeviceCallbacks(&myCallbacks);
+  scanner->setActiveScan(true);
+}
+
+// ================= LOOP =================
+
+void loop() {
+
+  // BUTTON
+  if (digitalRead(SosPin) == LOW) {
+
+    if (SosPressedAt == 0) SosPressedAt = millis();
+
+    unsigned long holdTime = millis() - SosPressedAt;
+
+    if (holdTime >= 2000 && holdTime < 3000) {
+      digitalWrite(Yellow, HIGH);
+      digitalWrite(red, HIGH);
+      tone(beepsound, 2200);
+    }
+
+    if (holdTime >= 3000 && !calibrationMode) {
+      calibrationMode = true;
+      calibrationStart = millis();
+      trustedCount = 0;
+
+      Serial.println("Calibration STARTED");
+
+      digitalWrite(Yellow, HIGH);
+      digitalWrite(red, HIGH);
+      noTone(beepsound);
+    }
+
+  } else {
+    SosPressedAt = 0;
+    digitalWrite(Yellow, LOW);
+    digitalWrite(red, LOW);
+    noTone(beepsound);
+  }
+
+  // CALIBRATION
+  if (calibrationMode) {
+
+    scanner->start(2, false);
+    scanner->clearResults();
+
+    if (millis() - calibrationStart >= CALIBRATION_DURATION) {
+      calibrationMode = false;
+
+      total_detecteddevices = 0;
+
+      digitalWrite(Yellow, LOW);
+      digitalWrite(red, LOW);
+
+      Serial.println("Calibration COMPLETE");
+    }
+
+    return;
+  }
+
+  // NORMAL SCAN
+  scanner->start(3, false);
+  scanner->clearResults();
+
+  int highestRisk = 0;
+  int riskIndex = -1;
+  unsigned long currentTime = millis();
+
+  for (int i = 0; i < total_detecteddevices; i++) {
+
+    if (Latest_signal_strength[i] < signal_strength_range)
+      continue;
+
+    unsigned long howLong = currentTime - first_detected_at[i];
+
+    if (howLong > danger_time_frame) {
+      highestRisk = 2;
+      riskIndex = i;
+    } 
+    else if (howLong > warning_time_frame && highestRisk < 2) {
+      highestRisk = 1;
+      riskIndex = i;
+    }
+  }
+
+  sys_state = highestRisk;
+
+  // PRINT + API + BUZZER
+  if (riskIndex != -1 && sys_state > 0) {
+
+    if (sys_state == 1) {
+      Serial.println("⚠️ WARNING: Device staying nearby");
+
+      // 🔊 WARNING BEEP
+      digitalWrite(beepsound, HIGH);
+      delay(150);
+      digitalWrite(beepsound, LOW);
+      delay(300);
+    } 
+    else if (sys_state == 2) {
+      Serial.println("🚨 DANGER: Suspicious device detected!");
+
+      // 🔊 CONTINUOUS BUZZ
+      digitalWrite(beepsound, HIGH);
+
+      if (millis() - lastSent > 10000) {
+        sendAlert(No_of_devices[riskIndex], Latest_signal_strength[riskIndex]);
+        lastSent = millis();
+      }
+    }
+
+    Serial.print("MAC: ");
+    Serial.println(No_of_devices[riskIndex]);
+
+    Serial.print("RSSI: ");
+    Serial.println(Latest_signal_strength[riskIndex]);
+
+    Serial.println("----------------------");
+  }
+
+  // STOP BUZZER WHEN SAFE
+  if (sys_state == 0) {
+    digitalWrite(beepsound, LOW);
+  }
+
+  Serial.print("State: ");
+  Serial.println(sys_state);
+}// modes
+bool calibrationMode = false;
+unsigned long calibrationStart = 0;
+
+// button timing
+unsigned long SosPressedAt = 0;
+
+// API cooldown
+unsigned long lastSent = 0;
+
+int sys_state = 0;
+
+// ================= HELPERS =================
+
+int checktheExisting(String addr) {  
+  for (int i = 0; i < total_detecteddevices; i++) {
+    if (No_of_devices[i] == addr) return i;
+  }
+  return -1; 
+}
+
+bool isTrusted(String addr) {
+  for (int i = 0; i < trustedCount; i++) {
+    if (trustedDevices[i] == addr) return true;
+  }
+  return false;
+}
+
+// ================= API =================
+
+void sendAlert(String mac, int rssi) {
+
+  if (WiFi.status() != WL_CONNECTED) return;
+
 WiFiClient client;
 HTTPClient http;
 
